@@ -1,19 +1,25 @@
+import concurrent.futures
+import json
+import logging
+import os
+import re
+import tempfile
+import time
+import urllib.parse
+import uuid
+from typing import Dict, List, Optional
+import google.generativeai as genai
+import requests
+import uvicorn
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from playwright.async_api import async_playwright
+from playwright.sync_api import sync_playwright
 from pydantic import BaseModel, HttpUrl
-from typing import Dict, List, Optional
-import uvicorn
-import requests
-from bs4 import BeautifulSoup
-import re
-import json
-import urllib.parse
-import concurrent.futures
-import google.generativeai as genai
-from dotenv import load_dotenv
-import os
-import logging
-import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 # Configure logging
@@ -26,7 +32,7 @@ load_dotenv()
 # Create FastAPI instance
 app = FastAPI(
     title="Website Cloner API",
-    description="API for cloning websites using BeautifulSoup",
+    description="API for cloning websites using BeautifulSoup and Playwright",
     version="1.0.0"
 )
 
@@ -42,16 +48,19 @@ app.add_middleware(
 # Pydantic models
 class WebsiteCloneRequest(BaseModel):
     url: HttpUrl
+    is_small: bool = True
 
 class WebsiteCloneResponse(BaseModel):
     html: str
-    css: List[Dict]
-    assets: Dict
     message: str
+    preview_id: str
 
 class GeminiResponse(BaseModel):
     html: str
     message: str
+
+# Store generated HTML content with unique IDs
+html_store = {}
 
 def get_base_url(url: str) -> str:
     """Extract base URL from the given URL"""
@@ -297,46 +306,15 @@ def generate_html_with_gemini(content: Dict) -> str:
         
         # Prepare the prompt for Gemini
         prompt = f"""
-        You are an expert web developer. Your task is to generate a complete HTML code that is EXACTLY the same as the original website.
-        The website must look 100% identical, including all styles, layout, and functionality.
-        
-        Website Data:
-        {json.dumps(content, indent=2)}
-        
-        CSS Content:
-        {combined_css}
-        
-        Requirements:
-        1. Create a pixel-perfect clone of the original website
-        2. Include ALL CSS exactly as provided above
-        3. Maintain the EXACT structure and layout
-        4. Include ALL assets (images, scripts, icons) with their original attributes
-        5. Preserve ALL styling, including:
-           - Colors
-           - Fonts
-           - Spacing
-           - Animations
-           - Transitions
-           - Media queries
-           - Custom properties
-        6. Use absolute URLs for all resources
-        7. Include all meta tags, title, and other head elements
-        8. Preserve all JavaScript functionality
-        9. Maintain responsive design
-        10. Keep all original classes and IDs
-        
-        Important:
-        - The output must be a complete, standalone HTML file
-        - Start with <!DOCTYPE html> and end with </html>
-        - Include all CSS in a <style> tag in the head section
-        - Link to all external CSS files
-        - Include all necessary scripts
-        - Make sure all URLs are absolute
-        - Preserve all original attributes and values
-        - The website must look EXACTLY the same as the original
-        - Do not add any extra newlines or formatting
-        """
+        Generate complete HTML replicating this website. Minimize whitespace but preserve all functionality:
 
+        Website: {json.dumps(content, indent=2)}
+        CSS: {combined_css}
+
+        Output: Complete standalone HTML file with inline CSS, absolute URLs, exact styling.
+        Start with <!DOCTYPE html>, include full <head> and <body> sections.
+        """
+        # logger.info(prompt)
         logger.info("Sending request to Gemini")
         response = model.generate_content(
             prompt,
@@ -400,26 +378,205 @@ def generate_html_with_gemini(content: Dict) -> str:
             detail=f"Error generating HTML with Gemini: {str(e)}"
         )
 
+async def clone_with_playwright(url: str) -> str:
+    """Clone website using Playwright with full resource capture"""
+    try:
+        async with async_playwright() as p:
+            # Launch browser with specific settings
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--disable-dev-shm-usage', '--no-sandbox']
+            )
+            
+            # Create context with specific settings
+            context = await browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                java_script_enabled=True
+            )
+            
+            # Set default timeout
+            context.set_default_timeout(60000)
+            
+            # Create a new page
+            page = await context.new_page()
+            
+            try:
+                # Enable request interception
+                await page.route("**/*", lambda route: route.continue_())
+                
+                # Navigate to the URL and wait for network to be idle
+                await page.goto(url, wait_until='networkidle', timeout=60000)
+                
+                # Wait for the page to be fully loaded
+                await page.wait_for_load_state('load', timeout=30000)
+                
+                # Wait for any lazy-loaded images
+                await page.wait_for_load_state('domcontentloaded')
+                
+                # Inject script to capture all styles
+                styles = await page.evaluate("""() => {
+                    const styles = [];
+                    // Get all stylesheets
+                    for (const sheet of document.styleSheets) {
+                        try {
+                            const rules = sheet.cssRules || sheet.rules;
+                            for (const rule of rules) {
+                                styles.push(rule.cssText);
+                            }
+                        } catch (e) {
+                            // Handle CORS errors
+                            console.log('Could not access stylesheet:', e);
+                        }
+                    }
+                    return styles;
+                }""")
+                
+                # Get all inline styles
+                inline_styles = await page.evaluate("""() => {
+                    const styles = [];
+                    const styleElements = document.getElementsByTagName('style');
+                    for (const style of styleElements) {
+                        styles.push(style.textContent);
+                    }
+                    return styles;
+                }""")
+                
+                # Get all images and convert to base64
+                images = await page.evaluate("""() => {
+                    const images = [];
+                    const imgElements = document.getElementsByTagName('img');
+                    for (const img of imgElements) {
+                        if (img.src) {
+                            images.push({
+                                src: img.src,
+                                alt: img.alt,
+                                style: img.getAttribute('style'),
+                                class: img.className
+                            });
+                        }
+                    }
+                    return images;
+                }""")
+                
+                # Get the final HTML content
+                html_content = await page.content()
+                
+                # Create a BeautifulSoup object to modify the HTML
+                soup = BeautifulSoup(html_content, 'html.parser')
+                
+                # Add all captured styles to the head
+                head = soup.find('head') or soup.new_tag('head')
+                if not soup.find('head'):
+                    soup.html.insert(0, head)
+                
+                # Add external stylesheets
+                for style in styles:
+                    style_tag = soup.new_tag('style')
+                    style_tag.string = style
+                    head.append(style_tag)
+                
+                # Add inline styles
+                for style in inline_styles:
+                    style_tag = soup.new_tag('style')
+                    style_tag.string = style
+                    head.append(style_tag)
+                
+                # Update image sources to be absolute
+                for img in soup.find_all('img'):
+                    if img.get('src'):
+                        if not img['src'].startswith(('http://', 'https://')):
+                            img['src'] = urllib.parse.urljoin(url, img['src'])
+                
+                # Add base styles to ensure proper rendering
+                base_style = soup.new_tag('style')
+                base_style.string = """
+                    * { box-sizing: border-box; }
+                    body { margin: 0; padding: 0; }
+                    img { max-width: 100%; height: auto; }
+                """
+                head.append(base_style)
+                
+                # Convert back to string
+                final_html = str(soup)
+                
+                return final_html
+                
+            except Exception as e:
+                logger.error(f"Error during page navigation: {str(e)}")
+                # If navigation fails, try to get whatever content is available
+                try:
+                    html_content = await page.content()
+                    if html_content:
+                        return html_content
+                except:
+                    pass
+                raise
+                
+            finally:
+                # Clean up
+                await context.close()
+                await browser.close()
+                
+    except Exception as e:
+        error_msg = str(e)
+        if "timeout" in error_msg.lower():
+            raise HTTPException(
+                status_code=504,
+                detail="Website took too long to load. Please try again or use a different URL."
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error cloning website with Playwright: {error_msg}"
+        )
+
 @app.post("/clone-website", response_model=WebsiteCloneResponse)
 async def clone_website(request: WebsiteCloneRequest):
     """Endpoint to clone a website"""
     try:
-        # Extract website content
-        content = extract_website_content(str(request.url))
+        logger.info(f"Received request to clone website: {request.url} (is_small: {request.is_small})")
         
-        # Only include non-empty structure
-        structure = content.get("structure", {})
-        if not structure:
-            structure = {"main": str(BeautifulSoup(fetch_url(str(request.url)), 'html.parser').find("body"))}
+        if request.is_small:
+            # For small websites, use Gemini
+            logger.info("Using Gemini for small website")
+            content = extract_website_content(str(request.url))
+            html_code = generate_html_with_gemini(content)
+        else:
+            # For large websites, use Playwright
+            logger.info("Using Playwright for large website")
+            try:
+                html_code = await clone_with_playwright(str(request.url))
+            except HTTPException as he:
+                # If Playwright fails, fall back to Gemini
+                logger.warning(f"Playwright failed, falling back to Gemini: {str(he)}")
+                content = extract_website_content(str(request.url))
+                html_code = generate_html_with_gemini(content)
+        
+        # Generate a unique ID for this HTML content
+        html_id = str(uuid.uuid4())
+        html_store[html_id] = html_code
+        
+        # Create a temporary file to store the HTML
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False) as f:
+            f.write(html_code)
+            temp_file_path = f.name
+        
+        logger.info(f"Successfully cloned website. HTML saved to: {temp_file_path}")
         
         return WebsiteCloneResponse(
-            html=json.dumps(structure, indent=2),
-            css=content.get("styles", []) + content.get("css_files", []),
-            assets=content.get("assets", {}),
-            message="Website content extracted successfully"
+            html=html_code,
+            message=f"Website cloned successfully. HTML saved to: {temp_file_path}",
+            preview_id=html_id
         )
+    except HTTPException as he:
+        logger.error(f"HTTP Exception in clone_website: {str(he)}")
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error in clone_website: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unexpected error: {str(e)}"
+        )
 
 @app.post("/generate-html", response_model=GeminiResponse)
 async def generate_html(request: WebsiteCloneRequest):
@@ -461,6 +618,28 @@ async def generate_html(request: WebsiteCloneRequest):
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "website-cloner-api"}
+
+@app.get("/preview/{html_id}", response_class=HTMLResponse)
+async def preview_html(html_id: str):
+    """Endpoint to preview generated HTML"""
+    if html_id not in html_store:
+        raise HTTPException(status_code=404, detail="Preview not found")
+    
+    html_content = html_store[html_id]
+    
+    # Check if the HTML content is empty or just contains basic structure
+    soup = BeautifulSoup(html_content, 'html.parser')
+    body_content = soup.body.get_text().strip() if soup.body else ""
+    
+    if not body_content:
+        # Add a warning message to the HTML
+        warning_div = soup.new_tag('div')
+        warning_div['style'] = 'position: fixed; top: 0; left: 0; right: 0; background: #ff4444; color: white; padding: 1rem; text-align: center; z-index: 9999;'
+        warning_div.string = 'Warning: The page appears to be empty. Try using the other website size option.'
+        soup.body.insert(0, warning_div)
+        html_content = str(soup)
+    
+    return HTMLResponse(content=html_content)
 
 def main():
     """Run the application"""
