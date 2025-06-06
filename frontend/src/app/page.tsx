@@ -52,7 +52,7 @@ export default function Home() {
           <h1 className="text-6xl font-light tracking-tight bg-gradient-to-r from-white to-white/80 bg-clip-text text-transparent">
             Website Cloner
           </h1>
-          <p className="text-white/60 text-lg">Transform any website into clean HTML</p>
+          <p className="text-white/60 text-lg">Transform any website into the HTML</p>
         </div>
         
         <form onSubmit={handleSubmit} className="mb-12">
