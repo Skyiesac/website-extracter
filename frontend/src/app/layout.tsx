@@ -13,7 +13,7 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Orchids Website Cloner",
+  title: "Website Cloner",
   description: "Clone any website with advanced features",
   icons: {
     icon: "/favicon.ico",

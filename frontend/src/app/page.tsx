@@ -2,6 +2,8 @@
 
 import { useState } from 'react';
 
+const API_BASE_URL = 'http://localhost:8000';
+
 export default function Home() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
@@ -18,7 +20,7 @@ export default function Home() {
     setPreviewId('');
 
     try {
-      const response = await fetch('http://localhost:8000/clone-website', {
+      const response = await fetch(`${API_BASE_URL}/clone-website`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, is_small: isSmall }),
@@ -41,7 +43,7 @@ export default function Home() {
 
   const handlePreview = () => {
     if (previewId) {
-      window.open(`http://localhost:8000/preview/${previewId}`, '_blank');
+      window.open(`${API_BASE_URL}/preview/${previewId}`, '_blank');
     }
   };
 
